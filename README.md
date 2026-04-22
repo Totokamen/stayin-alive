@@ -32,12 +32,6 @@ Not yet published on any store. Install in developer mode:
 | Breathing volume | urgency³, attenuated ≥2× advantage    | 0–0.12    | band-passed white noise + LFO |
 | Critical beep    | any clock ≤ 5 s                        | fixed 0.10 | square 880 Hz / 330 Hz |
 
-End-of-game jingles:
-
-- **Win**: Do-Mi-Sol (523 / 659 / 784 Hz), last note sustained (ratio 1-1-4)
-- **Loss**: Sol-Sol-Sol-Mi♭ (392 / 392 / 392 / 311 Hz), last note sustained (ratio 1-1-1-3)
-- **Draw**: Sol2-Sol2-Sol2 (196 Hz), last note sustained (ratio 1-1-2)
-
 ## Privacy
 
 - No network requests.
