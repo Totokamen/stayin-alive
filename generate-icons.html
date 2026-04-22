@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head><title>Generate Icons</title></head>
+<body>
+<p>Right-click each image and "Save image as" into the icons/ folder.</p>
+<canvas id="c16" width="16" height="16"></canvas>
+<canvas id="c48" width="48" height="48"></canvas>
+<canvas id="c128" width="128" height="128"></canvas>
+<script>
+function drawHeart(canvas) {
+  const ctx = canvas.getContext('2d');
+  const s = canvas.width;
+  ctx.clearRect(0, 0, s, s);
+
+  // Background circle
+  ctx.fillStyle = '#1a1a1a';
+  ctx.beginPath();
+  ctx.arc(s/2, s/2, s/2, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Heart
+  ctx.fillStyle = '#e74c3c';
+  ctx.beginPath();
+  const cx = s / 2;
+  const cy = s * 0.45;
+  const r = s * 0.22;
+  ctx.moveTo(cx, cy + r * 1.4);
+  ctx.bezierCurveTo(cx - r * 2, cy, cx - r * 1.2, cy - r * 1.4, cx, cy - r * 0.2);
+  ctx.bezierCurveTo(cx + r * 1.2, cy - r * 1.4, cx + r * 2, cy, cx, cy + r * 1.4);
+  ctx.fill();
+
+  // Convert to image for easy saving
+  const img = new Image();
+  img.src = canvas.toDataURL('image/png');
+  img.title = `icon${s}.png`;
+  canvas.parentNode.insertBefore(img, canvas.nextSibling);
+  canvas.style.display = 'none';
+}
+
+drawHeart(document.getElementById('c16'));
+drawHeart(document.getElementById('c48'));
+drawHeart(document.getElementById('c128'));
+</script>
+</body>
+</html>
