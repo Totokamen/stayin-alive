@@ -1,0 +1,20 @@
+# Signing keys - NEVER commit
+*.pem
+
+# Packaged artifacts
+*.crx
+*.zip
+
+# SVN metadata (keeping SVN alongside Git)
+.svn/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk
+Thumbs.db
+desktop.ini
+.DS_Store
