@@ -20,6 +20,7 @@
   background: #222;
   cursor: grab;
   border-bottom: 1px solid #333;
+  touch-action: none; /* prevent mobile scroll/zoom from hijacking the drag */
 }
 
 #stayin-alive-overlay .sa-header:active {

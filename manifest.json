@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Stayin' Alive",
   "description": "Audio feedback for Lichess chess clocks - feel the time pressure",
-  "version": "2.3.1",
+  "version": "2.3.2",
   "author": "LBSoft",
   "permissions": ["storage"],
   "content_scripts": [

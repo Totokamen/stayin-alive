@@ -19,7 +19,7 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.3.1';
+  const VERSION = '2.3.2';
   const POLL_FAST = 100;            // ms, during a game
   const POLL_SLOW = 1000;           // ms, elsewhere on Lichess
   const BPM_MIN = 40;
@@ -67,6 +67,7 @@
   // Overlay
   let overlay = null;
   let overlayAbort = null;          // AbortController for overlay listeners
+  let needsDefaultPosition = false; // true until board-relative default placed
 
   // End-of-game handling
   let resultSoundPlayed = false;
@@ -571,6 +572,9 @@
   //  OVERLAY
   // =============================================
 
+  const BOARD_SELECTORS = '.round__app__board, .main-board, cg-wrap, .cg-wrap';
+  const OVERLAY_GAP = 8;            // px between overlay and board edge
+
   function constrainToViewport(x, y) {
     const w = overlay ? overlay.offsetWidth : 130;
     const h = overlay ? overlay.offsetHeight : 80;
@@ -580,10 +584,50 @@
     };
   }
 
+  /**
+   * Default overlay position: just to the left of the board, aligned with its
+   * top edge. All values in viewport coordinates since the overlay uses
+   * `position: fixed`. Returns null if the board isn't laid out yet.
+   */
+  function computeDefaultPosition() {
+    const board = document.querySelector(BOARD_SELECTORS);
+    if (!board) return null;
+    const rect = board.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const overlayW = overlay?.offsetWidth || 130;
+    return {
+      x: Math.round(rect.left - overlayW - OVERLAY_GAP),
+      y: Math.round(rect.top)
+    };
+  }
+
+  function applyPosition(pos) {
+    if (!overlay) return;
+    const c = constrainToViewport(pos.x, pos.y);
+    overlay.style.left = c.x + 'px';
+    overlay.style.top = c.y + 'px';
+    overlay.style.visibility = 'visible';
+    state.overlayPosition = c;
+  }
+
+  function tryApplyDefaultPosition() {
+    if (!needsDefaultPosition || !overlay) return;
+    const pos = computeDefaultPosition();
+    if (pos) {
+      applyPosition(pos);
+      needsDefaultPosition = false;
+    } else if (overlay.style.visibility === 'hidden') {
+      // Board not ready: show at a safe temporary spot, keep the flag set
+      // so we retry on the next poll tick.
+      applyPosition({ x: 20, y: 80 });
+    }
+  }
+
   function createOverlay() {
     if (overlay) return;
     overlay = document.createElement('div');
     overlay.id = 'stayin-alive-overlay';
+    overlay.style.visibility = 'hidden'; // hidden until positioned (no flash at 0,0)
     overlay.innerHTML = `
       <div class="sa-header">
         <span class="sa-title">\u2665 Stayin' Alive</span>
@@ -598,13 +642,18 @@
     document.body.appendChild(overlay);
     dom.bpmEl = overlay.querySelector('.sa-bpm-value');
 
-    // Restore saved position (async) and clamp to current viewport
+    needsDefaultPosition = false;
+
+    // Restore saved position if any; otherwise place the overlay relative to
+    // the board's top-left corner (see computeDefaultPosition).
     chrome.storage.local.get('overlayPosition', (data) => {
-      if (data.overlayPosition) state.overlayPosition = data.overlayPosition;
       if (!overlay) return; // overlay destroyed before callback fired
-      const pos = constrainToViewport(state.overlayPosition.x, state.overlayPosition.y);
-      overlay.style.left = pos.x + 'px';
-      overlay.style.top = pos.y + 'px';
+      if (data.overlayPosition) {
+        applyPosition(data.overlayPosition);
+      } else {
+        needsDefaultPosition = true;
+        tryApplyDefaultPosition();
+      }
     });
 
     // All listeners share one AbortController so they're cleaned up together
@@ -612,30 +661,42 @@
     overlayAbort = new AbortController();
     const { signal } = overlayAbort;
 
+    const header = overlay.querySelector('.sa-header');
+    const toggleBtn = overlay.querySelector('.sa-toggle');
     let dragging = false, dragX = 0, dragY = 0;
 
-    overlay.querySelector('.sa-header').addEventListener('mousedown', (e) => {
+    // Pointer Events unify mouse, touch, and pen. setPointerCapture makes the
+    // header keep receiving move/up events even if the pointer drifts off it.
+    header.addEventListener('pointerdown', (e) => {
+      if (e.target.closest('.sa-toggle')) return; // let the button handle its click
       dragging = true;
       dragX = e.clientX - overlay.offsetLeft;
       dragY = e.clientY - overlay.offsetTop;
+      try { header.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       e.preventDefault();
     }, { signal });
 
-    document.addEventListener('mousemove', (e) => {
+    header.addEventListener('pointermove', (e) => {
       if (!dragging || !overlay) return;
       const pos = constrainToViewport(e.clientX - dragX, e.clientY - dragY);
       overlay.style.left = pos.x + 'px';
       overlay.style.top = pos.y + 'px';
     }, { signal });
 
-    document.addEventListener('mouseup', () => {
+    const endDrag = (e) => {
       if (!dragging || !overlay) return;
       dragging = false;
+      try { header.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
       state.overlayPosition = { x: overlay.offsetLeft, y: overlay.offsetTop };
+      needsDefaultPosition = false;
       chrome.storage.local.set({ overlayPosition: state.overlayPosition });
-    }, { signal });
+    };
 
-    overlay.querySelector('.sa-toggle').addEventListener('click', () => {
+    header.addEventListener('pointerup', endDrag, { signal });
+    header.addEventListener('pointercancel', endDrag, { signal });
+
+    toggleBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
       // Single source of truth: write to storage, the onChanged listener
       // applies it everywhere (including this overlay's UI).
       chrome.storage.local.set({ soundEnabled: !state.soundEnabled });
@@ -645,6 +706,7 @@
   function removeOverlay() {
     if (overlayAbort) { overlayAbort.abort(); overlayAbort = null; }
     if (overlay) { overlay.remove(); overlay = null; dom.bpmEl = null; }
+    needsDefaultPosition = false;
   }
 
   function updateOverlay() {
@@ -671,6 +733,7 @@
 
     setPollRate(POLL_FAST);
     if (!overlay) createOverlay();
+    else if (needsDefaultPosition) tryApplyDefaultPosition();
 
     const clocks = readClocks();
     if (!clocks) return;
