@@ -19,13 +19,18 @@
 (() => {
   'use strict';
 
-  const VERSION = '2.3.2';
+  const VERSION = '2.3.5';
   const POLL_FAST = 100;            // ms, during a game
   const POLL_SLOW = 1000;           // ms, elsewhere on Lichess
   const BPM_MIN = 40;
   const BPM_MAX = 180;
   const RESULT_DELAY_MS = 1000;     // wait before playing the result jingle
   const CRITICAL_THRESHOLD = 5;     // seconds, triggers urgent beeps
+  const VOLUME_MIN = 0;
+  const VOLUME_MAX = 2;             // 200% max, per user request
+  const VOLUME_DEFAULT = 1;         // 100%, the baseline mix
+  const VOLUME_STEP = 0.05;         // ± step for +/- hotkeys, 5 %
+  const DRAG_THRESHOLD = 4;         // px, min pointer movement to count as drag
 
   // =============================================
   //  STATE
@@ -33,7 +38,11 @@
 
   const state = {
     active: false,
-    soundEnabled: true,
+    soundEnabled: true,               // master audio toggle (from popup)
+    breathingEnabled: true,           // breathing-only toggle (from overlay button)
+    volumeMultiplier: VOLUME_DEFAULT, // master gain multiplier, 0..2
+    collapsed: false,                 // mini mode (just the heart glyph); persisted
+    panicked: false,                  // Space-bar panic mute; volatile, resets at game end
     totalTime: 0,                   // 0 = not yet initialized
     myTime: null,
     opponentTime: null,
@@ -54,6 +63,7 @@
   let audioCtx = null;
   let audioUnlocked = false;
   let noiseBuffer = null;
+  let masterGain = null;            // all audio routed through this for volume control
 
   let heartbeatTimeout = null;
   let criticalBeepTimeout = null;
@@ -68,10 +78,28 @@
   let overlay = null;
   let overlayAbort = null;          // AbortController for overlay listeners
   let needsDefaultPosition = false; // true until board-relative default placed
+  let nudgeTimeout = null;          // hides the numeric readout after a +/- nudge
+
+  // M-hotkey mute bookkeeping
+  //   muteRestoreValid: true right after toggleMute, flipped to false the
+  //     moment the user touches any of the three muted properties (volume,
+  //     sound, breath). This is what distinguishes "press M to undo the
+  //     previous M" from "press M to re-mute because I just moved the slider".
+  //   muteOpInFlight: set to true for the duration of our own storage write
+  //     so the onChanged listener doesn't mistake our mute for a user action
+  //     and invalidate itself.
+  let muteRestoreValid = false;
+  let muteOpInFlight = false;
 
   // End-of-game handling
   let resultSoundPlayed = false;
   let gameOverDetectedAt = 0;
+  // True only if isGameRunning() has been true at least once in the current
+  // session (i.e. we actually witnessed the live game). Stays false when we
+  // land on a page whose game is already over (fresh tab, hard reload, SPA
+  // nav to a finished game), so we don't replay the result jingle every time
+  // the user revisits a completed game.
+  let liveGameObserved = false;
 
   // =============================================
   //  UTILITIES
@@ -88,6 +116,7 @@
     state.opponentTime = null;
     resultSoundPlayed = false;
     gameOverDetectedAt = 0;
+    liveGameObserved = false;
   }
 
   function checkNavigation() {
@@ -125,6 +154,12 @@
   function ensureAudioContext() {
     if (!audioCtx) {
       audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      // Master gain node: every oscillator/buffer source connects here instead
+      // of audioCtx.destination, so adjusting volumeMultiplier attenuates the
+      // whole mix in one place.
+      masterGain = audioCtx.createGain();
+      masterGain.gain.value = state.volumeMultiplier;
+      masterGain.connect(audioCtx.destination);
     }
     if (audioCtx.state === 'suspended') audioCtx.resume();
     return audioCtx;
@@ -132,6 +167,21 @@
 
   const isAudioReady = () =>
     audioUnlocked && audioCtx && audioCtx.state === 'running';
+
+  /**
+   * Smoothly ramps the master gain to the current volumeMultiplier. Short
+   * ramp (50 ms) prevents zippering while still feeling responsive during
+   * slider drags.
+   */
+  function applyMasterVolume() {
+    if (!masterGain || !audioCtx) return;
+    const now = audioCtx.currentTime;
+    try {
+      masterGain.gain.cancelScheduledValues(now);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, now);
+      masterGain.gain.linearRampToValueAtTime(state.volumeMultiplier, now + 0.05);
+    } catch (e) { /* ignore */ }
+  }
 
   /**
    * Schedules a single tone. Unified helper used by heartbeat, critical beep
@@ -151,7 +201,7 @@
       } else {
         g.gain.linearRampToValueAtTime(0, start + duration);
       }
-      osc.connect(g).connect(audioCtx.destination);
+      osc.connect(g).connect(masterGain || audioCtx.destination);
       osc.start(start);
       osc.stop(start + duration + 0.02);
     } catch (e) { /* audio node failure, ignore */ }
@@ -321,14 +371,14 @@
   }
 
   function scheduleHeartbeat() {
-    if (!state.soundEnabled || !state.active) return;
+    if (!state.soundEnabled || !state.active || state.panicked) return;
     playHeartbeatPulse();
     heartbeatTimeout = setTimeout(scheduleHeartbeat, 60000 / state.bpm);
   }
 
   function startHeartbeat() {
     stopHeartbeat();
-    if (state.soundEnabled && state.active) scheduleHeartbeat();
+    if (state.soundEnabled && state.active && !state.panicked) scheduleHeartbeat();
   }
 
   function stopHeartbeat() {
@@ -340,7 +390,7 @@
   // =============================================
 
   function startBreathing() {
-    if (breathing || !state.soundEnabled || !state.active || !isAudioReady()) return;
+    if (breathing || !state.soundEnabled || !state.breathingEnabled || !state.active || state.panicked || !isAudioReady()) return;
     try {
       const now = audioCtx.currentTime;
 
@@ -365,7 +415,7 @@
 
       source.connect(filter);
       filter.connect(gain);
-      gain.connect(audioCtx.destination);
+      gain.connect(masterGain || audioCtx.destination);
       lfo.connect(lfoGain);
       lfoGain.connect(gain.gain);
 
@@ -526,6 +576,12 @@
 
   function handleGameOver() {
     if (resultSoundPlayed || !state.soundEnabled) return;
+    // Don't play the result jingle if we never observed the live game this
+    // session — landing on a page that's already showing `.result-wrap`
+    // (reload, SPA navigation, fresh tab) should stay silent. Otherwise a
+    // quick keypress right after reload races the audio-unlock against
+    // handleGameOver's delay and fires the jingle out of context.
+    if (!liveGameObserved) return;
     if (!isGameOver()) return;
     if (gameOverDetectedAt === 0) gameOverDetectedAt = Date.now();
     if (Date.now() - gameOverDetectedAt < RESULT_DELAY_MS) return;
@@ -547,8 +603,8 @@
   }
 
   /**
-   * Single source of truth for toggling sound. Updates state, restarts or
-   * stops audio pipelines, and syncs the overlay button UI.
+   * Single source of truth for toggling sound. Updates state and restarts or
+   * stops the audio pipelines. The popup owns the UI for this toggle.
    */
   function setSoundEnabled(enabled) {
     if (state.soundEnabled === enabled) return;
@@ -559,13 +615,154 @@
     } else {
       stopAllSounds();
     }
+  }
+
+  /**
+   * Toggles ONLY the breathing layer. Heartbeat, critical beeps and result
+   * jingles keep playing. Driven by the small coloured button in the overlay
+   * header (green = breath on, grey = breath off).
+   */
+  function setBreathingEnabled(enabled) {
+    if (state.breathingEnabled === enabled) return;
+    state.breathingEnabled = enabled;
+    if (enabled && state.soundEnabled && state.active) {
+      startBreathing();
+    } else {
+      stopBreathing();
+    }
     if (overlay) {
       const btn = overlay.querySelector('.sa-toggle');
       if (btn) {
-        btn.textContent = enabled ? 'ON' : 'OFF';
         btn.classList.toggle('sa-off', !enabled);
+        btn.title = enabled ? 'Breath on' : 'Breath off';
       }
     }
+  }
+
+  /**
+   * Panic mute: silences heartbeat + breathing while keeping critical beeps
+   * and result jingles active. Volatile state, not persisted, auto-resets at
+   * game end. Triggered by the Space bar hotkey.
+   */
+  function setPanicMode(enabled) {
+    if (state.panicked === enabled) return;
+    state.panicked = enabled;
+    if (enabled) {
+      stopHeartbeat();
+      stopBreathing();
+    } else if (state.soundEnabled && state.active) {
+      startHeartbeat();
+      if (state.breathingEnabled) startBreathing();
+    }
+    if (overlay) overlay.classList.toggle('sa-panic', enabled);
+  }
+
+  /**
+   * Mini mode: collapses the overlay to just a pulsing heart glyph. Click
+   * on the title heart collapses, click on the collapsed heart re-expands.
+   * Persisted to storage so the choice survives page reload.
+   */
+  function setCollapsed(value) {
+    const v = !!value;
+    if (state.collapsed === v) return;
+    state.collapsed = v;
+    if (overlay) overlay.classList.toggle('sa-collapsed', v);
+    chrome.storage.local.set({ collapsed: v });
+  }
+
+  /**
+   * Nudges the master volume by ±VOLUME_STEP, clamped to [MIN..MAX]. Used
+   * by the +/- hotkeys; writes the new value back to storage so the slider
+   * UI and onChanged listener stay in sync. A transient `.sa-nudged` class
+   * on the cursor reveals the numeric readout for a moment, mirroring the
+   * bubble that appears during a mouse drag.
+   */
+  function adjustVolume(delta) {
+    const next = clamp(state.volumeMultiplier + delta, VOLUME_MIN, VOLUME_MAX);
+    if (next === state.volumeMultiplier) return;
+    state.volumeMultiplier = next;
+    applyMasterVolume();
+    setVolumeCursorPosition(next);
+    chrome.storage.local.set({ volumeMultiplier: next });
+
+    if (overlay) {
+      const cursor = overlay.querySelector('.sa-volume-cursor');
+      if (cursor) {
+        cursor.classList.add('sa-nudged');
+        if (nudgeTimeout) clearTimeout(nudgeTimeout);
+        nudgeTimeout = setTimeout(() => {
+          cursor.classList.remove('sa-nudged');
+          nudgeTimeout = null;
+        }, 700);
+      }
+    }
+  }
+
+  /**
+   * True mute/unmute for the M hotkey. Muting forces all three "audible
+   * axes" off at once: master sound, volume, and breathing toggle. The
+   * overlay slider drops to zero AND the breath button goes grey. Unmuting
+   * restores all three from the saved snapshot.
+   *
+   * Snapshot policy:
+   *   - volumeBeforeMute refreshes with the latest audible value each time
+   *     the user re-mutes after moving the slider, so restore returns to
+   *     the NEW audible volume, not the stale one.
+   *   - breathingBeforeMute is STICKY: once captured on the first mute it
+   *     survives re-mutes, so the restore always returns the breath button
+   *     to the state the user originally chose, not the OFF we forced.
+   *
+   * Restore gate:
+   *   muteRestoreValid tracks whether anything changed since the last M
+   *   press. Set true at the end of every toggleMute; flipped to false in
+   *   the storage.onChanged listener whenever the user touches vol / sound
+   *   / breath via the popup, slider, breath button, H, +/-, etc. If it's
+   *   false when M is pressed, we treat that press as a FRESH MUTE instead
+   *   of a restore — matching the spec "any interaction between two M
+   *   presses cancels the restore and re-mutes everything".
+   */
+  function toggleMute() {
+    chrome.storage.local.get(['volumeBeforeMute', 'breathingBeforeMute'], (data) => {
+      const hasSave = Number.isFinite(data.volumeBeforeMute);
+      const canRestore = muteRestoreValid && hasSave;
+
+      muteOpInFlight = true;
+
+      if (canRestore) {
+        const restoreVol = data.volumeBeforeMute > 0
+          ? data.volumeBeforeMute
+          : VOLUME_DEFAULT;
+        const restoreBreath = typeof data.breathingBeforeMute === 'boolean'
+          ? data.breathingBeforeMute
+          : true;
+        chrome.storage.local.set({
+          soundEnabled: true,
+          volumeMultiplier: restoreVol,
+          breathingEnabled: restoreBreath
+        });
+        chrome.storage.local.remove(['volumeBeforeMute', 'breathingBeforeMute']);
+      } else {
+        // Fresh mute. Volume snapshot refreshes with the current audible
+        // value (fallback to the previous save if we're somehow at zero,
+        // else default, so restore always lands on something audible).
+        // Breath snapshot is sticky: keep the existing one if we have it.
+        const saveVol = state.volumeMultiplier > 0
+          ? state.volumeMultiplier
+          : (hasSave && data.volumeBeforeMute > 0 ? data.volumeBeforeMute : VOLUME_DEFAULT);
+        const saveBreath = (hasSave && typeof data.breathingBeforeMute === 'boolean')
+          ? data.breathingBeforeMute
+          : state.breathingEnabled;
+        chrome.storage.local.set({
+          volumeBeforeMute: saveVol,
+          breathingBeforeMute: saveBreath,
+          soundEnabled: false,
+          volumeMultiplier: 0,
+          breathingEnabled: false
+        });
+      }
+
+      muteRestoreValid = true;
+    });
   }
 
   // =============================================
@@ -573,7 +770,32 @@
   // =============================================
 
   const BOARD_SELECTORS = '.round__app__board, .main-board, cg-wrap, .cg-wrap';
+  const THEME_SOURCE_SELECTORS = '.round__side, .game__meta, main';
   const OVERLAY_GAP = 8;            // px between overlay and board edge
+
+  /**
+   * Reads the current Lichess theme colours from the game side panel and
+   * applies them as CSS custom properties on the overlay, so the overlay
+   * blends with whatever skin the user has active instead of being locked
+   * to a hardcoded dark grey.
+   */
+  function applyLichessTheme() {
+    if (!overlay) return;
+    const source = document.querySelector(THEME_SOURCE_SELECTORS) || document.body;
+
+    // Walk up the tree until we find a non-transparent background; panels
+    // often inherit their background from a parent.
+    let bg = null;
+    for (let el = source; el && el !== document.documentElement; el = el.parentElement) {
+      const c = getComputedStyle(el).backgroundColor;
+      if (c && c !== 'rgba(0, 0, 0, 0)' && c !== 'transparent') { bg = c; break; }
+    }
+
+    const fg = getComputedStyle(source).color;
+
+    if (bg) overlay.style.setProperty('--sa-bg', bg);
+    if (fg) overlay.style.setProperty('--sa-fg', fg);
+  }
 
   function constrainToViewport(x, y) {
     const w = overlay ? overlay.offsetWidth : 130;
@@ -623,24 +845,88 @@
     }
   }
 
+  /**
+   * Converts a pointer Y coordinate to a volume multiplier by mapping it
+   * across the track's bounding box. Top of track = VOLUME_MAX, bottom = 0.
+   */
+  function multiplierFromClientY(trackEl, clientY) {
+    const rect = trackEl.getBoundingClientRect();
+    if (!rect.height) return state.volumeMultiplier;
+    const y = clamp(clientY - rect.top, 0, rect.height);
+    const frac = y / rect.height;            // 0 at top, 1 at bottom
+    return clamp((1 - frac) * VOLUME_MAX, VOLUME_MIN, VOLUME_MAX);
+  }
+
+  /**
+   * Moves the slider cursor to reflect the given multiplier and updates the
+   * readout text. Cursor centre sits at top:(1 - m/2)*100% of the track.
+   */
+  function setVolumeCursorPosition(multiplier) {
+    if (!overlay) return;
+    const cursor = overlay.querySelector('.sa-volume-cursor');
+    const readout = overlay.querySelector('.sa-volume-readout');
+    if (!cursor) return;
+    const frac = 1 - multiplier / VOLUME_MAX;
+    cursor.style.top = (frac * 100) + '%';
+    if (readout) readout.textContent = Math.round(multiplier * 100) + '%';
+  }
+
+  /**
+   * Snaps a free-range multiplier (0..2) to the closest of the three tick
+   * values: min/default/max. Used for track clicks so the three tacche act
+   * as magnets.
+   */
+  function snapToTick(multiplier) {
+    const ticks = [VOLUME_MIN, VOLUME_DEFAULT, VOLUME_MAX];
+    let best = ticks[0], bestD = Infinity;
+    for (const t of ticks) {
+      const d = Math.abs(multiplier - t);
+      if (d < bestD) { best = t; bestD = d; }
+    }
+    return best;
+  }
+
   function createOverlay() {
     if (overlay) return;
     overlay = document.createElement('div');
     overlay.id = 'stayin-alive-overlay';
     overlay.style.visibility = 'hidden'; // hidden until positioned (no flash at 0,0)
     overlay.innerHTML = `
-      <div class="sa-header">
-        <span class="sa-title">\u2665 Stayin' Alive</span>
-        <button class="sa-toggle${state.soundEnabled ? '' : ' sa-off'}" title="Toggle sounds">${state.soundEnabled ? 'ON' : 'OFF'}</button>
+      <div class="sa-collapsed-heart sa-drag-handle" title="Expand">\u2665</div>
+      <div class="sa-header sa-drag-handle">
+        <div class="sa-title-zone">
+          <span class="sa-title"><span class="sa-heart" title="Collapse">\u2665</span> Stayin' Alive</span>
+        </div>
+        <div class="sa-toggle-zone">
+          <button class="sa-toggle${state.breathingEnabled ? '' : ' sa-off'}" aria-label="Toggle breathing sound" title="${state.breathingEnabled ? 'Breath on' : 'Breath off'}"></button>
+        </div>
       </div>
-      <div class="sa-bpm">
-        <span class="sa-bpm-value">${state.bpm}</span>
-        <span class="sa-bpm-label">BPM</span>
+      <div class="sa-body">
+        <div class="sa-content">
+          <div class="sa-bpm">
+            <span class="sa-bpm-value">${state.bpm}</span>
+            <span class="sa-bpm-label">BPM</span>
+          </div>
+          <div class="sa-version">v${VERSION} by LBSoft</div>
+        </div>
+        <div class="sa-volume" title="Volume">
+          <div class="sa-volume-track">
+            <div class="sa-tick sa-tick-max"></div>
+            <div class="sa-tick sa-tick-default"></div>
+            <div class="sa-tick sa-tick-min"></div>
+            <div class="sa-volume-cursor" title="Drag to change volume, double-click to reset to 100%">
+              <span class="sa-volume-readout">100%</span>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="sa-version">v${VERSION} by LBSoft</div>
     `;
+    if (state.collapsed) overlay.classList.add('sa-collapsed');
+    if (state.panicked) overlay.classList.add('sa-panic');
     document.body.appendChild(overlay);
     dom.bpmEl = overlay.querySelector('.sa-bpm-value');
+    applyLichessTheme();
+    setVolumeCursorPosition(state.volumeMultiplier);
 
     needsDefaultPosition = false;
 
@@ -661,45 +947,151 @@
     overlayAbort = new AbortController();
     const { signal } = overlayAbort;
 
-    const header = overlay.querySelector('.sa-header');
     const toggleBtn = overlay.querySelector('.sa-toggle');
-    let dragging = false, dragX = 0, dragY = 0;
 
-    // Pointer Events unify mouse, touch, and pen. setPointerCapture makes the
-    // header keep receiving move/up events even if the pointer drifts off it.
-    header.addEventListener('pointerdown', (e) => {
-      if (e.target.closest('.sa-toggle')) return; // let the button handle its click
-      dragging = true;
-      dragX = e.clientX - overlay.offsetLeft;
-      dragY = e.clientY - overlay.offsetTop;
-      try { header.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-      e.preventDefault();
+    // Drag is wired to every element carrying `.sa-drag-handle`: the expanded
+    // header AND the collapsed heart. A tiny movement threshold distinguishes
+    // a real drag (commit new position) from a click on the collapsed heart
+    // (re-expand the overlay) so we don't need two separate gesture systems.
+    function wireDragHandle(handleEl) {
+      let dragging = false, dragX = 0, dragY = 0, downX = 0, downY = 0, moved = false;
+
+      handleEl.addEventListener('pointerdown', (e) => {
+        // Let internal controls handle their own clicks without hijacking them.
+        if (e.target.closest('.sa-toggle') || e.target.closest('.sa-heart')) return;
+        dragging = true;
+        moved = false;
+        downX = e.clientX;
+        downY = e.clientY;
+        dragX = e.clientX - overlay.offsetLeft;
+        dragY = e.clientY - overlay.offsetTop;
+        try { handleEl.setPointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        e.preventDefault();
+      }, { signal });
+
+      handleEl.addEventListener('pointermove', (e) => {
+        if (!dragging || !overlay) return;
+        if (!moved &&
+            (Math.abs(e.clientX - downX) > DRAG_THRESHOLD ||
+             Math.abs(e.clientY - downY) > DRAG_THRESHOLD)) {
+          moved = true;
+        }
+        if (!moved) return;
+        const pos = constrainToViewport(e.clientX - dragX, e.clientY - dragY);
+        overlay.style.left = pos.x + 'px';
+        overlay.style.top = pos.y + 'px';
+      }, { signal });
+
+      const endDrag = (e) => {
+        if (!dragging || !overlay) return;
+        dragging = false;
+        try { handleEl.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
+        if (moved) {
+          state.overlayPosition = { x: overlay.offsetLeft, y: overlay.offsetTop };
+          needsDefaultPosition = false;
+          chrome.storage.local.set({ overlayPosition: state.overlayPosition });
+        } else if (handleEl.classList.contains('sa-collapsed-heart')) {
+          // Click without movement on the collapsed heart re-expands.
+          setCollapsed(false);
+        }
+      };
+
+      handleEl.addEventListener('pointerup', endDrag, { signal });
+      handleEl.addEventListener('pointercancel', endDrag, { signal });
+    }
+
+    overlay.querySelectorAll('.sa-drag-handle').forEach(wireDragHandle);
+
+    // Click on the title heart → collapse to mini mode. The drag handler
+    // above already bails out when the pointerdown target is .sa-heart, so
+    // a bare click fires cleanly here.
+    const titleHeart = overlay.querySelector('.sa-header .sa-heart');
+    if (titleHeart) {
+      titleHeart.addEventListener('click', (e) => {
+        e.stopPropagation();
+        setCollapsed(true);
+      }, { signal });
+    }
+
+    // Re-clamp the overlay to the viewport if the window is resized
+    // (otherwise a position saved with a wide window leaves the overlay
+    // off-screen after shrinking the browser).
+    window.addEventListener('resize', () => {
+      if (overlay && state.overlayPosition) applyPosition(state.overlayPosition);
     }, { signal });
 
-    header.addEventListener('pointermove', (e) => {
-      if (!dragging || !overlay) return;
-      const pos = constrainToViewport(e.clientX - dragX, e.clientY - dragY);
-      overlay.style.left = pos.x + 'px';
-      overlay.style.top = pos.y + 'px';
-    }, { signal });
-
-    const endDrag = (e) => {
-      if (!dragging || !overlay) return;
-      dragging = false;
-      try { header.releasePointerCapture(e.pointerId); } catch (err) { /* ignore */ }
-      state.overlayPosition = { x: overlay.offsetLeft, y: overlay.offsetTop };
-      needsDefaultPosition = false;
-      chrome.storage.local.set({ overlayPosition: state.overlayPosition });
-    };
-
-    header.addEventListener('pointerup', endDrag, { signal });
-    header.addEventListener('pointercancel', endDrag, { signal });
-
+    // Breathing toggle. Writes to storage; the onChanged listener applies
+    // the new state everywhere (keeps multiple tabs in sync too).
+    // We immediately blur() so the button doesn't keep keyboard focus: a
+    // focused <button> treats the Space bar as a synthetic click, which
+    // would hijack our Space = panic hotkey right after any mouse click.
     toggleBtn.addEventListener('click', (e) => {
       e.stopPropagation();
-      // Single source of truth: write to storage, the onChanged listener
-      // applies it everywhere (including this overlay's UI).
-      chrome.storage.local.set({ soundEnabled: !state.soundEnabled });
+      chrome.storage.local.set({ breathingEnabled: !state.breathingEnabled });
+      toggleBtn.blur();
+    }, { signal });
+
+    // -----------------------------------------------------------------
+    //  Volume slider
+    //
+    //  Click on the empty track → snap to the nearest tick (min / default /
+    //  max act as magnets). Pointerdown on the cursor → start a free drag
+    //  (0..200 %). Double-click on the cursor → reset to 100 %.
+    //
+    //  We intentionally do NOT use setPointerCapture: on Chromium it can
+    //  suppress the synthesized click/dblclick events, which breaks the
+    //  double-click-to-reset gesture. Instead the drag uses window-level
+    //  pointermove/pointerup so it keeps working if the pointer drifts off
+    //  the track, without interfering with click generation.
+    // -----------------------------------------------------------------
+    const volTrack = overlay.querySelector('.sa-volume-track');
+    const volCursor = overlay.querySelector('.sa-volume-cursor');
+    let volDragging = false;
+
+    const commitVolume = (m) => {
+      state.volumeMultiplier = m;
+      setVolumeCursorPosition(m);
+      applyMasterVolume();
+    };
+
+    volTrack.addEventListener('pointerdown', (e) => {
+      e.stopPropagation(); // don't let the overlay header drag react
+      if (e.target.closest('.sa-volume-cursor')) {
+        // Grab the cursor → free drag
+        volDragging = true;
+        volCursor.classList.add('sa-dragging');
+      } else {
+        // Empty track → snap to nearest tick, no drag
+        const raw = multiplierFromClientY(volTrack, e.clientY);
+        const snapped = snapToTick(raw);
+        commitVolume(snapped);
+        chrome.storage.local.set({ volumeMultiplier: snapped });
+      }
+    }, { signal });
+
+    // Window-level drag handlers so the pointer can leave the track without
+    // losing the drag. Guarded by volDragging so unrelated pointer activity
+    // on the page is ignored.
+    window.addEventListener('pointermove', (e) => {
+      if (!volDragging) return;
+      commitVolume(multiplierFromClientY(volTrack, e.clientY));
+    }, { signal });
+
+    const endVolDrag = () => {
+      if (!volDragging) return;
+      volDragging = false;
+      volCursor.classList.remove('sa-dragging');
+      chrome.storage.local.set({ volumeMultiplier: state.volumeMultiplier });
+    };
+
+    window.addEventListener('pointerup', endVolDrag, { signal });
+    window.addEventListener('pointercancel', endVolDrag, { signal });
+
+    // Double-click on the cursor → snap back to 100 %.
+    volCursor.addEventListener('dblclick', (e) => {
+      e.stopPropagation();
+      commitVolume(VOLUME_DEFAULT);
+      chrome.storage.local.set({ volumeMultiplier: VOLUME_DEFAULT });
     }, { signal });
   }
 
@@ -723,6 +1115,7 @@
     if (!isGamePage()) {
       if (state.active || overlay) {
         state.active = false;
+        state.panicked = false;         // clear the volatile panic flag
         stopAllSounds();
         removeOverlay();
         resetGameCache();
@@ -747,15 +1140,18 @@
     if (isGameRunning()) {
       if (!state.active) {
         state.active = true;
+        liveGameObserved = true;
         resultSoundPlayed = false;
         gameOverDetectedAt = 0;
       }
 
       updateBreathing();
 
-      if (state.soundEnabled && !heartbeatTimeout) startHeartbeat();
-      if (state.soundEnabled && !breathing)       startBreathing();
+      if (state.soundEnabled && !state.panicked && !heartbeatTimeout) startHeartbeat();
+      if (state.soundEnabled && state.breathingEnabled && !state.panicked && !breathing) startBreathing();
 
+      // Critical beeps stay audible even in panic mode: they are the one alert
+      // you cannot afford to miss when the clock is about to flag.
       const anyCritical = state.myTime <= CRITICAL_THRESHOLD
                        || state.opponentTime <= CRITICAL_THRESHOLD;
       if (anyCritical && !criticalBeepTimeout && state.soundEnabled) startCriticalBeep();
@@ -763,6 +1159,12 @@
     } else {
       if (state.active) {
         state.active = false;
+        // Game ended → drop the panic flag so the next game starts unmuted,
+        // and refresh the overlay chrome to match.
+        if (state.panicked) {
+          state.panicked = false;
+          if (overlay) overlay.classList.remove('sa-panic');
+        }
         stopAllSounds();
       }
       handleGameOver();
@@ -776,7 +1178,8 @@
   function loadSettings() {
     return new Promise((resolve) => {
       chrome.storage.local.get(
-        ['soundEnabled', 'heartbeatEnabled', 'overlayPosition'],
+        ['soundEnabled', 'heartbeatEnabled', 'breathingEnabled',
+         'overlayPosition', 'volumeMultiplier', 'collapsed'],
         (data) => {
           if (data.soundEnabled !== undefined) {
             state.soundEnabled = data.soundEnabled;
@@ -786,7 +1189,16 @@
             chrome.storage.local.set({ soundEnabled: data.heartbeatEnabled });
             chrome.storage.local.remove('heartbeatEnabled');
           }
+          if (typeof data.breathingEnabled === 'boolean') {
+            state.breathingEnabled = data.breathingEnabled;
+          }
+          if (typeof data.collapsed === 'boolean') {
+            state.collapsed = data.collapsed;
+          }
           if (data.overlayPosition) state.overlayPosition = data.overlayPosition;
+          if (Number.isFinite(data.volumeMultiplier)) {
+            state.volumeMultiplier = clamp(data.volumeMultiplier, VOLUME_MIN, VOLUME_MAX);
+          }
           resolve();
         }
       );
@@ -801,10 +1213,107 @@
     pollInterval = setInterval(pollGameState, currentPollRate);
 
     chrome.storage.onChanged.addListener((changes) => {
+      // Any change to the three M-tracked axes that wasn't part of our own
+      // toggleMute write means the user touched something (popup checkbox,
+      // slider drag/click, breath button, H, +/-, another tab, …). Consume
+      // the pending restore so the next M press does a FRESH mute instead
+      // of bringing back stale values — matches the spec "after moving the
+      // slide (or changing the button), M mutes again rather than restores".
+      const userTouchedMuteAxis = !muteOpInFlight && (
+        changes.volumeMultiplier !== undefined ||
+        changes.soundEnabled !== undefined ||
+        changes.breathingEnabled !== undefined
+      );
+      if (userTouchedMuteAxis) muteRestoreValid = false;
+      muteOpInFlight = false;
+
       if (changes.soundEnabled) {
         setSoundEnabled(changes.soundEnabled.newValue);
       }
+      if (changes.breathingEnabled) {
+        setBreathingEnabled(!!changes.breathingEnabled.newValue);
+      }
+      if (changes.volumeMultiplier) {
+        const v = changes.volumeMultiplier.newValue;
+        if (Number.isFinite(v)) {
+          state.volumeMultiplier = clamp(v, VOLUME_MIN, VOLUME_MAX);
+          applyMasterVolume();
+          setVolumeCursorPosition(state.volumeMultiplier);
+        }
+      }
+      if (changes.collapsed !== undefined) {
+        // Echoed from another tab: apply the class without re-persisting
+        // (setCollapsed writes back to storage, which would loop).
+        state.collapsed = !!changes.collapsed.newValue;
+        if (overlay) overlay.classList.toggle('sa-collapsed', state.collapsed);
+      }
     });
+
+    // -----------------------------------------------------------------
+    //  Global hotkeys
+    //
+    //   Space  panic mute toggle (heartbeat + breath silenced, critical
+    //          beeps still play, auto-reset at game end)
+    //   H      toggle breathing
+    //   M      true mute (saves volume, zeros it + disables sound; re-press
+    //          restores both)
+    //   + / -  nudge volume by ±VOLUME_STEP
+    //
+    //  Gated on the overlay being present (we are on a Lichess game page
+    //  with our UI attached) rather than state.active, because overlay
+    //  creation slightly precedes state.active and we need the Space bar
+    //  to stop scrolling the page immediately from the first keystroke.
+    //
+    //  Registered in the capture phase so we get the event before Lichess
+    //  or other extensions can react — this is what actually prevents the
+    //  default scroll on some Chromium builds.
+    //
+    //  Suppressed when a text input / chat has the focus so we never steal
+    //  a character; Ctrl/Alt/Meta also pass through for native shortcuts.
+    // -----------------------------------------------------------------
+    document.addEventListener('keydown', (e) => {
+      if (!overlay) return;
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+      const el = document.activeElement;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) return;
+
+      // Toggle-style hotkeys use e.code (physical key) and debounce key
+      // repeat so holding the key doesn't flicker the state on/off. We
+      // still preventDefault on every repeat so Space never falls through
+      // to the page's default scroll.
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (!e.repeat && state.active) setPanicMode(!state.panicked);
+        return;
+      }
+      if (e.code === 'KeyH') {
+        e.preventDefault();
+        if (!e.repeat) chrome.storage.local.set({ breathingEnabled: !state.breathingEnabled });
+        return;
+      }
+      if (e.code === 'KeyM') {
+        e.preventDefault();
+        if (!e.repeat) toggleMute();
+        return;
+      }
+
+      // Volume nudges use e.key (the glyph typed) so '+' and '-' work on
+      // layouts where those characters live in different physical positions
+      // than on a US keyboard (Italian, German, French, …). e.key also
+      // already covers the numpad '+' / '-', so we don't need a separate
+      // case for it. Auto-repeat is welcome: holding the key ramps the
+      // volume smoothly.
+      if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        adjustVolume(+VOLUME_STEP);
+        return;
+      }
+      if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        adjustVolume(-VOLUME_STEP);
+        return;
+      }
+    }, true);  // capture phase
   }
 
   init();
