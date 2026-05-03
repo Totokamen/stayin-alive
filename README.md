@@ -21,7 +21,8 @@ A small widget appears in the top-left corner of every game page. It contains:
 - A **drag handle**: grab the title bar and move the overlay anywhere on the page. The position is saved across reloads.
 - A **mini mode**: click the heart glyph to collapse the overlay into a tiny round puck (just the heart). Click again to expand. The collapsed position is saved separately from the expanded one, so each layout remembers its own spot.
 - **Theme awareness**: the overlay adapts its colours to the active Lichess theme (light, dark, transparent and custom themes).
-
+- **Muted indicator**: when audio is disabled (via M or the popup), the overlay dims to make the state immediately visible.
+  
 ## Keyboard hotkeys
 
 When the overlay is on the page, the following keys work globally (they are ignored while typing in chat or any other input field):
