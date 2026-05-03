@@ -284,3 +284,25 @@
   color: #888;
   transition: color 0.25s ease;
 }
+
+/* Master audio off (popup checkbox / M true mute). This is deliberately
+   stronger than breath-off: the whole audio surface is silent. */
+#stayin-alive-overlay.sa-muted .sa-heart,
+#stayin-alive-overlay.sa-muted .sa-bpm-value,
+#stayin-alive-overlay.sa-muted .sa-collapsed-heart {
+  color: #888;
+  transition: color 0.25s ease;
+}
+
+#stayin-alive-overlay.sa-muted .sa-volume-cursor {
+  background: #888;
+  transition: background-color 0.25s ease;
+}
+
+#stayin-alive-overlay.sa-muted .sa-toggle {
+  opacity: 0.45;
+}
+
+#stayin-alive-overlay.sa-muted .sa-volume-track {
+  opacity: 0.45;
+}

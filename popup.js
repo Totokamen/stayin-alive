@@ -18,12 +18,38 @@
 
 document.addEventListener('DOMContentLoaded', () => {
   const soundToggle = document.getElementById('sound-toggle');
+  const versionEl = document.getElementById('sa-version');
+
+  if (versionEl && chrome.runtime?.getManifest) {
+    const version = chrome.runtime.getManifest().version;
+    versionEl.textContent = `v${version} by LBSoft`;
+  }
 
   chrome.storage.local.get(['soundEnabled'], (data) => {
     soundToggle.checked = data.soundEnabled !== undefined ? data.soundEnabled : true;
   });
 
+  // Keep the checkbox in sync if another surface (M hotkey, overlay, second
+  // tab) flips soundEnabled while the popup is open.
+  chrome.storage.onChanged.addListener((changes) => {
+    if (changes.soundEnabled) {
+      soundToggle.checked = !!changes.soundEnabled.newValue;
+    }
+  });
+
+  // Delegate to the shared true-mute API so the checkbox uses the same state
+  // machine as the M hotkey: tick = full unmute (restore from snapshot if
+  // available, sane defaults otherwise); untick = full mute (zero all three
+  // audio axes and save the snapshot).
   soundToggle.addEventListener('change', () => {
-    chrome.storage.local.set({ soundEnabled: soundToggle.checked });
+    const mute = window.STAYIN_ALIVE && window.STAYIN_ALIVE.mute;
+    if (!mute) {
+      // Fallback in case sa.mute.js failed to load: legacy partial behaviour
+      // is better than no behaviour at all.
+      chrome.storage.local.set({ soundEnabled: soundToggle.checked });
+      return;
+    }
+    if (soundToggle.checked) mute.applyUnmute();
+    else mute.applyMute();
   });
 });

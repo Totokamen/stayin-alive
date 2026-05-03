@@ -1,0 +1,11 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "target": "ES2021",
+    "module": "ES2020"
+  },
+  "exclude": [
+    ".svn",
+    "icons"
+  ]
+}

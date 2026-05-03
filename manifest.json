@@ -2,13 +2,13 @@
   "manifest_version": 3,
   "name": "Stayin' Alive",
   "description": "Audio feedback for Lichess chess clocks - feel the time pressure",
-  "version": "2.3.5",
+  "version": "2.4.2",
   "author": "LBSoft",
   "permissions": ["storage"],
   "content_scripts": [
     {
       "matches": ["*://lichess.org/*"],
-      "js": ["content.js"],
+      "js": ["content.config.js", "sa.utils.js", "sa.clock.js", "sa.mute.js", "sa.audio.js", "sa.overlay.js", "sa.hotkeys.js", "sa.storage-sync.js", "sa.bootstrap.js", "content.js"],
       "css": ["overlay.css"],
       "run_at": "document_idle"
     }

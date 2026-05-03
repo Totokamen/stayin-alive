@@ -26,8 +26,8 @@ A small widget appears in the top-left corner of every game page. It contains:
 
 When the overlay is on the page, the following keys work globally (they are ignored while typing in chat or any other input field):
 
-| Key       | Action                                                       |
-| --------- | ------------------------------------------------------------ |
+| Key       | Action                                                                  |
+|-----------|-------------------------------------------------------------------------|
 | `Space`   | **Panic mute**: instantly silences all live audio. Press again to resume. |
 | `H`       | Toggle the breathing layer on/off (same as the small switch in the title bar). |
 | `M`       | **True mute**: saves the current volume and breath state, sets volume to 0 and disables both sound and breath. Press `M` again to restore exactly what was there before. |
@@ -53,12 +53,12 @@ Not yet published on any store. Install in developer mode:
 
 ## How the audio reacts
 
-| Signal           | Drives                                       | Range         | Waveform                      |
-| ---------------- | -------------------------------------------- | ------------- | ----------------------------- |
-| Heartbeat BPM    | `myTime / oppTime` ratio (log scale)         | 40 to 180 BPM | sine 55 Hz + 75 Hz            |
-| Heartbeat volume | absolute time remaining (urgency²)           | 0.15 to 0.80  |                               |
-| Breathing volume | urgency³, attenuated at 2× or more advantage | 0 to 0.12     | band-passed white noise + LFO |
-| Critical beep    | any clock at 5 s or less                     | fixed 0.10    | square 880 Hz / 330 Hz        |
+| Signal             | Drives                                       | Range          | Waveform                          |
+|--------------------|----------------------------------------------|----------------|-----------------------------------|
+| Heartbeat BPM      | `myTime / oppTime` ratio (log scale)         | 40 to 180 BPM  | sine 55 Hz + 75 Hz                |
+| Heartbeat volume   | absolute time remaining (urgency²)           | 0.15 to 0.80   |                                   |
+| Breathing volume   | urgency³, attenuated at 2× or more advantage | 0 to 0.12      | band-passed white noise + LFO     |
+| Critical beep      | any clock at 5 s or less                     | fixed 0.10     | square 880 Hz / 330 Hz            |
 
 End-of-game jingles:
 
